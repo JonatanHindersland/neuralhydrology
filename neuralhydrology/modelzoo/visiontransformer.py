@@ -10,11 +10,13 @@ from neuralhydrology.modelzoo.inputlayer import InputLayer
 from neuralhydrology.modelzoo.head import get_head
 from neuralhydrology.modelzoo.basemodel import BaseModel
 from neuralhydrology.utils.config import Config
+from pyts.image import GramianAngularField
+import matplotlib.pyplot as plt
 
 LOGGER = logging.getLogger(__name__)
 
 
-class Transformer(BaseModel):
+class VisionTransformer(BaseModel):
     """Transformer model class, which relies on PyTorch's TransformerEncoder class.
 
     This class implements the encoder of a transformer network which can be used for regression.
@@ -40,13 +42,15 @@ class Transformer(BaseModel):
         The run configuration.
     """
     # specify submodules of the model that can later be used for finetuning. Names must match class attributes
-    module_parts = ['embedding_net', 'encoder', 'head']
+    module_parts = ['embedding_net', 'transformer', 'head']
 
     def __init__(self, cfg: Config):
-        super(Transformer, self).__init__(cfg=cfg)
+        super(VisionTransformer, self).__init__(cfg=cfg)
 
         # embedding net before transformer
         self.embedding_net = InputLayer(cfg)
+
+        self.gaf = GramianAngularField(image_size=50)
 
         # ensure that the number of inputs into the self-attention layer is divisible by the number of heads
         if self.embedding_net.output_size % cfg.transformer_nheads != 0:
@@ -58,9 +62,9 @@ class Transformer(BaseModel):
         # positional encoder
         self._positional_encoding_type = cfg.transformer_positional_encoding_type
         if self._positional_encoding_type.lower() == 'concatenate':
-            encoder_dim = self.embedding_net.output_size * 2
+            self.encoder_dim = self.embedding_net.output_size * 2
         elif self._positional_encoding_type.lower() == 'sum':
-            encoder_dim = self.embedding_net.output_size
+            self.encoder_dim = self.embedding_net.output_size
         else:
             raise RuntimeError(f"Unrecognized positional encoding type: {self._positional_encoding_type}")
         self.positional_encoder = _PositionalEncoding(embedding_dim=self.embedding_net.output_size,
@@ -72,7 +76,7 @@ class Transformer(BaseModel):
         self._mask = None
 
         # encoder
-        encoder_layers = nn.TransformerEncoderLayer(d_model=encoder_dim,
+        encoder_layers = nn.TransformerEncoderLayer(d_model=self.encoder_dim,
                                                     nhead=cfg.transformer_nheads,
                                                     dim_feedforward=cfg.transformer_dim_feedforward,
                                                     dropout=cfg.transformer_dropout)
@@ -80,9 +84,17 @@ class Transformer(BaseModel):
                                              num_layers=cfg.transformer_nlayers,
                                              norm=None)
 
+        self.transformer = nn.Transformer(d_model=self.encoder_dim,
+                                          nhead=cfg.transformer_nheads,
+                                          num_encoder_layers=cfg.transformer_nlayers,
+                                          num_decoder_layers=cfg.transformer_nlayers,
+                                          dim_feedforward=cfg.transformer_dim_feedforward,
+                                          dropout=cfg.transformer_dropout,
+                                          activation="relu")
+
         # head (instead of a decoder)
         self.dropout = nn.Dropout(p=cfg.output_dropout)
-        self.head = get_head(cfg=cfg, n_in=encoder_dim, n_out=self.output_size)
+        self.head = get_head(cfg=cfg, n_in=self.encoder_dim, n_out=self.output_size)
 
         # init weights and biases
         self._reset_parameters()
@@ -112,19 +124,35 @@ class Transformer(BaseModel):
         """
         # pass dynamic and static inputs through embedding layers, then concatenate them
         x_d = self.embedding_net(data)
+        y = data['y']
+
+
+        gafInput = x_d.cpu().detach().numpy().reshape([self.cfg.seq_length,self.cfg.batch_size*self.encoder_dim])
+
+        im_train = self.gaf.fit_transform(gafInput)
+
+        print(im_train.shape)
+
+        # plot one image
+        plt.imshow(im_train[0])
+        plt.show()
+
+
+        x_d = x_d.transpose(0,1)
+        y = y.nan_to_num()
+        y = y.repeat(1, 1, self.encoder_dim)
 
         positional_encoding = self.positional_encoder(x_d * self._sqrt_embedding_dim)
-        #positional_encoding = self.positional_encoder(x_d)
+        y_positional_encoding = self.positional_encoder(y)
 
         # mask out future values
         if self._mask is None or self._mask.size(0) != len(x_d):
             self._mask = torch.triu(x_d.new_full((len(x_d), len(x_d)), fill_value=float('-inf')), diagonal=1)
-
-        # encoding
-        output = self.encoder(positional_encoding, self._mask)
+        # Transformer
+        output = self.transformer(positional_encoding, y_positional_encoding, self._mask)
 
         # head
-        pred = self.head(self.dropout(output.transpose(0, 1)))
+        pred = self.head(self.dropout(output))
 
         # add embedding and positional encoding to output
         pred['embedding'] = x_d

@@ -401,6 +401,14 @@ class Config(object):
         self._cfg["is_finetuning"] = flag
 
     @property
+    def is_eval(self) -> bool:
+        return self._cfg.get("is_eval", False)
+
+    @is_eval.setter
+    def is_eval(self, flag: bool):
+        self._cfg["is_eval"] = flag
+
+    @property
     def lagged_features(self) -> dict:
         return self._as_default_dict(self._cfg.get("lagged_features", {}))
 

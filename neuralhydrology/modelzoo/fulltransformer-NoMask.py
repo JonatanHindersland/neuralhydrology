@@ -1,10 +1,12 @@
 import logging
 import math
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from neuralhydrology.modelzoo.fc import FC
 
 from neuralhydrology.modelzoo.inputlayer import InputLayer
 from neuralhydrology.modelzoo.head import get_head
@@ -14,7 +16,7 @@ from neuralhydrology.utils.config import Config
 LOGGER = logging.getLogger(__name__)
 
 
-class Transformer(BaseModel):
+class FullTransformer(BaseModel):
     """Transformer model class, which relies on PyTorch's TransformerEncoder class.
 
     This class implements the encoder of a transformer network which can be used for regression.
@@ -40,10 +42,10 @@ class Transformer(BaseModel):
         The run configuration.
     """
     # specify submodules of the model that can later be used for finetuning. Names must match class attributes
-    module_parts = ['embedding_net', 'encoder', 'head']
+    module_parts = ['embedding_net', 'transformer', 'head']
 
     def __init__(self, cfg: Config):
-        super(Transformer, self).__init__(cfg=cfg)
+        super(FullTransformer, self).__init__(cfg=cfg)
 
         # embedding net before transformer
         self.embedding_net = InputLayer(cfg)
@@ -53,26 +55,41 @@ class Transformer(BaseModel):
             raise ValueError("Embedding dimension must be divisible by number of transformer heads. "
                              "Use statics_embedding/dynamics_embedding and embedding_hiddens to specify the embedding.")
 
+        #if self.cfg.predict_last_n != self.cfg.seq_length - 1 and not self.cfg.is_eval:
+            #raise ValueError("For the transformer model the length of predict_last_n needs to be seq_length - 1 during training")
+
+        if self.cfg.is_eval and self.cfg.predict_last_n > 1:
+            raise ValueError("The transformer model does not currently support predicting more than 1 day in the future")
+
         self._sqrt_embedding_dim = math.sqrt(self.embedding_net.output_size)
+
+
+
+
+        self.target_embedding = FC(input_size=len(cfg.target_variables), hidden_sizes=[self.embedding_net.output_size])
 
         # positional encoder
         self._positional_encoding_type = cfg.transformer_positional_encoding_type
         if self._positional_encoding_type.lower() == 'concatenate':
-            encoder_dim = self.embedding_net.output_size * 2
+            self.model_dim = self.embedding_net.output_size * 2
         elif self._positional_encoding_type.lower() == 'sum':
-            encoder_dim = self.embedding_net.output_size
+            self.model_dim = self.embedding_net.output_size
         else:
             raise RuntimeError(f"Unrecognized positional encoding type: {self._positional_encoding_type}")
+
+
+
         self.positional_encoder = _PositionalEncoding(embedding_dim=self.embedding_net.output_size,
-                                                      dropout=cfg.transformer_positional_dropout,
-                                                      position_type=cfg.transformer_positional_encoding_type,
-                                                      max_len=cfg.seq_length)
+                                                  dropout=cfg.transformer_positional_dropout,
+                                                  position_type=cfg.transformer_positional_encoding_type,
+                                                  max_len=cfg.seq_length)
 
         # positional mask
-        self._mask = None
+        self._srcmask = None
+        self._tgtmask = None
 
         # encoder
-        encoder_layers = nn.TransformerEncoderLayer(d_model=encoder_dim,
+        encoder_layers = nn.TransformerEncoderLayer(d_model=self.model_dim,
                                                     nhead=cfg.transformer_nheads,
                                                     dim_feedforward=cfg.transformer_dim_feedforward,
                                                     dropout=cfg.transformer_dropout)
@@ -80,21 +97,46 @@ class Transformer(BaseModel):
                                              num_layers=cfg.transformer_nlayers,
                                              norm=None)
 
+        decoder_layers = nn.TransformerDecoderLayer(d_model=self.model_dim,
+                                                    nhead=cfg.transformer_nheads,
+                                                    dim_feedforward=cfg.transformer_dim_feedforward,
+                                                    dropout=cfg.transformer_dropout)
+        self.decoder = nn.TransformerDecoder(decoder_layer=decoder_layers,
+                                             num_layers=cfg.transformer_nlayers,
+                                             norm=None)
+
+
+
+        self.transformer = nn.Transformer(d_model=self.model_dim,
+                                          nhead=cfg.transformer_nheads,
+                                          num_encoder_layers=cfg.transformer_nlayers,
+                                          num_decoder_layers=cfg.transformer_nlayers,
+                                          dim_feedforward=cfg.transformer_dim_feedforward,
+                                          dropout=cfg.transformer_dropout)
+
+
+
         # head (instead of a decoder)
         self.dropout = nn.Dropout(p=cfg.output_dropout)
-        self.head = get_head(cfg=cfg, n_in=encoder_dim, n_out=self.output_size)
+        self.head = get_head(cfg=cfg, n_in=self.model_dim, n_out=self.output_size)
 
         # init weights and biases
-        self._reset_parameters()
+        #self._reset_parameters()
 
     def _reset_parameters(self):
         # this initialization strategy was tested empirically but may not be the universally best strategy in all cases.
         initrange = 0.1
-        for layer in self.encoder.layers:
+        for layer in self.transformer.encoder.layers:
             layer.linear1.weight.data.uniform_(-initrange, initrange)
             layer.linear1.bias.data.zero_()
             layer.linear2.weight.data.uniform_(-initrange, initrange)
             layer.linear2.bias.data.zero_()
+
+        for decoder_layer in self.transformer.decoder.layers:
+            decoder_layer.linear1.weight.data.uniform_(-initrange, initrange)
+            decoder_layer.linear1.bias.data.zero_()
+            decoder_layer.linear2.weight.data.uniform_(-initrange, initrange)
+            decoder_layer.linear2.bias.data.zero_()
 
     def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Perform a forward pass on a transformer model without decoder.
@@ -112,20 +154,71 @@ class Transformer(BaseModel):
         """
         # pass dynamic and static inputs through embedding layers, then concatenate them
         x_d = self.embedding_net(data)
+        #x_d = x_d[1:]
+        y = data['y']
+        y = y.transpose(0, 1)
+        y = y[:-1]
+        #print(y.shape)
+        #nanmask = ~torch.isnan(y)
+        #print(nanmask.shape)
+        y = y.nan_to_num()  #NOTE TO SELF, MASK NAN
+        y = y.repeat(1,1,self.model_dim)
+        #y = self.target_embedding(y)
+
+
 
         positional_encoding = self.positional_encoder(x_d * self._sqrt_embedding_dim)
-        #positional_encoding = self.positional_encoder(x_d)
+        y_positional_encoding = self.positional_encoder(y * self._sqrt_embedding_dim)
+
 
         # mask out future values
-        if self._mask is None or self._mask.size(0) != len(x_d):
-            self._mask = torch.triu(x_d.new_full((len(x_d), len(x_d)), fill_value=float('-inf')), diagonal=1)
+        if self._srcmask is None or self._srcmask.size(0) != len(x_d):
+            self._srcmask = torch.triu(x_d.new_full((len(x_d), len(x_d)), fill_value=float('-inf')), diagonal=1)
+            self._srcmask = torch.roll(self._srcmask, shifts=1, dims=1)
+            self._srcmask[:,0] = 0
 
-        # encoding
-        output = self.encoder(positional_encoding, self._mask)
+        if self._tgtmask is None or self._tgtmask.size(0) != len(y):
+            self._tgtmask = torch.triu(y.new_full((len(y), len(y)), fill_value=float('-inf')), diagonal=1)
+
+
+
+        #print(self._tgtmask.shape)
+
+        #self._tgtmask = self._tgtmask | nanmask
+
+        #print(self._tgtmask)
+
+        #self._tgtmask[:,-self.cfg.predict_last_n:]= float('-inf')
+
+
+
+        #encoder_output = self.encoder(positional_encoding, self._srcmask)
+
+        '''y_hat = y[:-self.cfg.predict_last_n,:,:]
+
+        for i in range(self.cfg.seq_length - self.cfg.predict_last_n,self.cfg.seq_length):
+            ones = torch.zeros(1, y.size()[1], y.size()[2]).to(torch.device(self.cfg.device))
+            y_hat = torch.cat((y_hat, ones))
+
+            self._srcmask = torch.triu(x_d.new_full((len(y_hat), len(x_d)), fill_value=float('-inf')), diagonal=1)
+
+            self._tgtmask = torch.triu(y_hat.new_full((len(y_hat), len(y_hat)), fill_value=float('-inf')), diagonal=1)
+
+            if(self.cfg.is_eval):
+                # Transformer
+                y_hat = self.decoder(y_hat,encoder_output,self._tgtmask,self._srcmask)
+            else:
+                input = y[:i+1,:,:]
+                y_hat = self.decoder(y_hat, encoder_output, self._tgtmask, self._srcmask)
+                #y_hat[i] = output[i]
+            print(y_hat.shape)'''
+
+        # Transformer
+        output = self.transformer(src= positional_encoding, tgt = y_positional_encoding)
+
 
         # head
         pred = self.head(self.dropout(output.transpose(0, 1)))
-
         # add embedding and positional encoding to output
         pred['embedding'] = x_d
         pred['positional_encoding'] = positional_encoding

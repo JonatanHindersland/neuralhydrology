@@ -23,6 +23,7 @@ from neuralhydrology.training import get_loss_obj, get_optimizer, get_regulariza
 from neuralhydrology.training.logger import Logger
 from neuralhydrology.utils.config import Config
 from neuralhydrology.utils.logging_utils import setup_logging
+from neuralhydrology.evaluation.plots import avgLossPlot
 
 LOGGER = logging.getLogger(__name__)
 
@@ -204,6 +205,7 @@ class BaseTrainer(object):
         Train the model for the number of epochs specified in the run configuration, and perform validation after every
         ``validate_every`` epochs. Model and optimizer state are saved after every ``save_weights_every`` epochs.
         """
+        losses = []
         for epoch in range(self._epoch + 1, self._epoch + self.cfg.epochs + 1):
             if epoch in self.cfg.learning_rate.keys():
                 LOGGER.info(f"Setting learning rate to {self.cfg.learning_rate[epoch]}")
@@ -213,6 +215,7 @@ class BaseTrainer(object):
             self._train_epoch(epoch=epoch)
             avg_loss = self.experiment_logger.summarise()
             LOGGER.info(f"Epoch {epoch} average loss: {avg_loss}")
+            losses.append(avg_loss)
 
             if epoch % self.cfg.save_weights_every == 0:
                 self._save_weights_and_optimizer(epoch)
@@ -230,6 +233,7 @@ class BaseTrainer(object):
                     print_msg += f" -- Median validation metrics: "
                     print_msg += ", ".join(f"{k}: {v:.5f}" for k, v in valid_metrics.items() if k != 'avg_loss')
                     LOGGER.info(print_msg)
+        avgLossPlot(losses,self.cfg)
 
         # make sure to close tensorboard to avoid losing the last epoch
         if self.cfg.log_tensorboard:

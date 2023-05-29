@@ -3,6 +3,7 @@ from typing import Tuple
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from neuralhydrology.utils.config import Config
 
 
 def percentile_plot(y: np.ndarray,
@@ -161,3 +162,17 @@ def uncertainty_plot(y: np.ndarray, y_hat: np.ndarray, title: str = '') -> Tuple
     fig.tight_layout(rect=[0, 0.1, 1, 0.95])
 
     return fig, axs
+
+def avgLossPlot(array: list,cfg: Config):
+    plt.plot(array)
+
+    # naming the x axis
+    plt.xlabel('Epoch')
+    # naming the y axis
+    plt.ylabel('Loss')
+    # giving a title to my graph
+    plt.title('Loss over time')
+
+    plt.savefig(f"{cfg.run_dir}/losses")
+
+
